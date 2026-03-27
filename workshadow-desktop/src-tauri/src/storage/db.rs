@@ -159,6 +159,93 @@ impl Database {
         Ok(count as u64)
     }
 
+    /// Get a single frame by ID.
+    pub fn get_frame_by_id(&self, frame_id: i64) -> Result<Option<FrameRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp_ms, segment_file, segment_offset, window_title, app_id, browser_url, ocr_text
+             FROM frames WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query_map(params![frame_id], |row| {
+            Ok(FrameRow {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                timestamp_ms: row.get::<_, i64>(2)? as u64,
+                segment_file: row.get(3)?,
+                segment_offset: row.get(4)?,
+                window_title: row.get(5)?,
+                app_id: row.get(6)?,
+                browser_url: row.get(7)?,
+                ocr_text: row.get(8)?,
+            })
+        })?;
+
+        match rows.next() {
+            Some(Ok(row)) => Ok(Some(row)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
+    /// Get total session count.
+    pub fn total_sessions(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Get the oldest and newest frame timestamps.
+    pub fn frame_timestamp_range(&self) -> Result<(Option<u64>, Option<u64>)> {
+        let conn = self.conn.lock().unwrap();
+        let oldest: Option<i64> = conn
+            .query_row("SELECT MIN(timestamp_ms) FROM frames", [], |row| row.get(0))
+            .ok();
+        let newest: Option<i64> = conn
+            .query_row("SELECT MAX(timestamp_ms) FROM frames", [], |row| row.get(0))
+            .ok();
+        Ok((oldest.map(|v| v as u64), newest.map(|v| v as u64)))
+    }
+
+    /// Get aggregated app usage for a given day (start_ms..end_ms).
+    /// Returns Vec<(app_id, frame_count)> sorted by count descending.
+    pub fn get_app_usage(&self, start_ms: u64, end_ms: u64) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(app_id, 'unknown'), COUNT(*) as cnt
+             FROM frames
+             WHERE timestamp_ms >= ?1 AND timestamp_ms <= ?2
+             GROUP BY app_id
+             ORDER BY cnt DESC
+             LIMIT 20",
+        )?;
+
+        let rows = stmt.query_map(params![start_ms as i64, end_ms as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+
+        rows.collect()
+    }
+
+    /// Get top window titles for a given day.
+    pub fn get_top_windows(&self, start_ms: u64, end_ms: u64) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(window_title, 'unknown'), COUNT(*) as cnt
+             FROM frames
+             WHERE timestamp_ms >= ?1 AND timestamp_ms <= ?2
+             GROUP BY window_title
+             ORDER BY cnt DESC
+             LIMIT 20",
+        )?;
+
+        let rows = stmt.query_map(params![start_ms as i64, end_ms as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })?;
+
+        rows.collect()
+    }
+
     /// Delete frames in a time range (for user-initiated deletion).
     pub fn delete_frames_in_range(&self, start_ms: u64, end_ms: u64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();

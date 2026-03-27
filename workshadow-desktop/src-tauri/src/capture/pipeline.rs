@@ -10,6 +10,7 @@ use crate::ocr::engine::OcrEngine;
 use crate::ocr::pii::detect_pii;
 use crate::ocr::OcrConfig;
 use crate::privacy::exclusions::ExclusionFilter;
+use crate::search::index::SearchIndex;
 use crate::storage::db::Database;
 
 /// The full capture pipeline: screen → downscale → encode → OCR → store → index.
@@ -30,11 +31,6 @@ impl CapturePipeline {
         }
     }
 
-    /// Get a cloneable handle to the capture status.
-    pub fn status_handle(&self) -> Arc<Mutex<CaptureStatus>> {
-        Arc::clone(&self.status)
-    }
-
     /// Start the full pipeline. Returns immediately; work happens on background threads.
     pub fn start(
         &self,
@@ -42,6 +38,7 @@ impl CapturePipeline {
         data_dir: PathBuf,
         ocr_config: OcrConfig,
         exclusion_filter: ExclusionFilter,
+        search_index: Option<Arc<SearchIndex>>,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         if self.running.load(Ordering::Relaxed) {
             return Err("Pipeline already running".into());
@@ -118,8 +115,12 @@ impl CapturePipeline {
             }
 
             // OCR (on the downscaled frame)
-            let ocr_result =
-                ocr_engine.process_frame(&scaled_data, scaled_w, scaled_h, frame.metadata.timestamp_ms);
+            let ocr_result = ocr_engine.process_frame(
+                &scaled_data,
+                scaled_w,
+                scaled_h,
+                frame.metadata.timestamp_ms,
+            );
 
             // Dedup check
             let should_store = {
@@ -151,7 +152,7 @@ impl CapturePipeline {
                     Some(ocr_result.full_text.as_str())
                 };
 
-                if let Err(e) = db.insert_frame(
+                match db.insert_frame(
                     session_id,
                     &frame.metadata,
                     &segment_file,
@@ -159,7 +160,24 @@ impl CapturePipeline {
                     ocr_text,
                     pii_flags.as_deref(),
                 ) {
-                    log::error!("DB insert error: {}", e);
+                    Ok(frame_id) => {
+                        // Index in Tantivy search
+                        if let Some(ref idx) = search_index {
+                            if let Err(e) = idx.add_frame(
+                                frame_id,
+                                frame.metadata.timestamp_ms,
+                                ocr_text.unwrap_or(""),
+                                &frame.metadata.active_window_title,
+                                &frame.metadata.app_bundle_id,
+                                frame.metadata.browser_url.as_deref(),
+                            ) {
+                                log::error!("Search index error: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("DB insert error: {}", e);
+                    }
                 }
             }
 
@@ -230,7 +248,7 @@ mod tests {
         let filter = ExclusionFilter::new(vec![], vec![]);
 
         let session_id = pipeline
-            .start(db, dir.path().to_path_buf(), ocr_config, filter)
+            .start(db, dir.path().to_path_buf(), ocr_config, filter, None)
             .unwrap();
         assert!(session_id > 0);
 
@@ -238,9 +256,34 @@ mod tests {
         assert_eq!(status.state, CaptureState::Recording);
         assert_eq!(status.session_id, Some(session_id));
 
-        // Give it a moment then stop
         std::thread::sleep(std::time::Duration::from_millis(100));
         pipeline.stop();
         assert_eq!(pipeline.get_status().state, CaptureState::Idle);
+    }
+
+    #[test]
+    fn test_pipeline_with_search_index() {
+        let config = CaptureConfig::default();
+        let pipeline = CapturePipeline::new(config);
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("index");
+        let ocr_config = OcrConfig::default();
+        let filter = ExclusionFilter::new(vec![], vec![]);
+        let search_index = Arc::new(SearchIndex::open(&index_dir).unwrap());
+
+        let session_id = pipeline
+            .start(
+                db,
+                dir.path().join("data"),
+                ocr_config,
+                filter,
+                Some(search_index),
+            )
+            .unwrap();
+        assert!(session_id > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        pipeline.stop();
     }
 }

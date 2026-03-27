@@ -1,5 +1,6 @@
 use super::{SearchFilters, SearchResult};
 use std::path::Path;
+use std::sync::Mutex;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -9,9 +10,7 @@ use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument};
 pub struct SearchIndex {
     index: Index,
     reader: IndexReader,
-    writer: std::sync::Mutex<IndexWriter>,
-    #[allow(dead_code)]
-    schema: Schema,
+    writer: Mutex<IndexWriter>,
     // Field handles
     field_frame_id: Field,
     field_timestamp: Field,
@@ -19,7 +18,10 @@ pub struct SearchIndex {
     field_window_title: Field,
     field_app_id: Field,
     field_browser_url: Field,
+    uncommitted_count: Mutex<usize>,
 }
+
+const COMMIT_BATCH_SIZE: usize = 100;
 
 impl SearchIndex {
     pub fn open(index_dir: &Path) -> tantivy::Result<Self> {
@@ -44,18 +46,19 @@ impl SearchIndex {
         Ok(Self {
             index,
             reader,
-            writer: std::sync::Mutex::new(writer),
-            schema,
+            writer: Mutex::new(writer),
             field_frame_id,
             field_timestamp,
             field_ocr_text,
             field_window_title,
             field_app_id,
             field_browser_url,
+            uncommitted_count: Mutex::new(0),
         })
     }
 
     /// Index a frame's OCR text and metadata.
+    /// Auto-commits after every COMMIT_BATCH_SIZE documents.
     pub fn add_frame(
         &self,
         frame_id: i64,
@@ -78,13 +81,25 @@ impl SearchIndex {
         }
 
         writer.add_document(doc)?;
+        drop(writer);
+
+        // Auto-commit periodically
+        let mut count = self.uncommitted_count.lock().unwrap();
+        *count += 1;
+        if *count >= COMMIT_BATCH_SIZE {
+            *count = 0;
+            drop(count);
+            self.commit()?;
+        }
+
         Ok(())
     }
 
-    /// Commit pending index writes.
+    /// Commit pending index writes and reload the reader.
     pub fn commit(&self) -> tantivy::Result<()> {
         let mut writer = self.writer.lock().unwrap();
         writer.commit()?;
+        self.reader.reload()?;
         Ok(())
     }
 
@@ -98,7 +113,11 @@ impl SearchIndex {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(
             &self.index,
-            vec![self.field_ocr_text, self.field_window_title, self.field_browser_url],
+            vec![
+                self.field_ocr_text,
+                self.field_window_title,
+                self.field_browser_url,
+            ],
         );
 
         let query = query_parser.parse_query(query_str)?;
@@ -132,7 +151,7 @@ impl SearchIndex {
                 .unwrap_or("")
                 .to_string();
 
-            // Apply filters
+            // Apply post-query filters
             if let Some(from) = filters.date_from {
                 if timestamp_ms < from {
                     continue;
@@ -160,5 +179,115 @@ impl SearchIndex {
         }
 
         Ok(results)
+    }
+
+    /// Get the number of documents in the index.
+    pub fn num_docs(&self) -> u64 {
+        let searcher = self.reader.searcher();
+        searcher.num_docs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_index() -> (tempfile::TempDir, SearchIndex) {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open(dir.path()).unwrap();
+        (dir, index)
+    }
+
+    #[test]
+    fn test_add_and_search() {
+        let (_dir, index) = setup_index();
+
+        index
+            .add_frame(
+                1,
+                1000,
+                "rust programming language systems",
+                "Rust Book - Firefox",
+                "firefox",
+                Some("doc.rust-lang.org"),
+            )
+            .unwrap();
+
+        index
+            .add_frame(
+                2,
+                2000,
+                "python data science machine learning",
+                "Jupyter Notebook - Chrome",
+                "chrome",
+                Some("localhost:8888"),
+            )
+            .unwrap();
+
+        index.commit().unwrap();
+
+        let results = index
+            .search("rust programming", &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].frame_id, 1);
+        assert!(results[0].relevance_score > 0.0);
+    }
+
+    #[test]
+    fn test_search_with_date_filter() {
+        let (_dir, index) = setup_index();
+
+        index.add_frame(1, 1000, "hello world", "Window 1", "app1", None).unwrap();
+        index.add_frame(2, 5000, "hello world", "Window 2", "app2", None).unwrap();
+        index.commit().unwrap();
+
+        let filters = SearchFilters {
+            date_from: Some(3000),
+            ..Default::default()
+        };
+        let results = index.search("hello", &filters, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].frame_id, 2);
+    }
+
+    #[test]
+    fn test_search_with_app_filter() {
+        let (_dir, index) = setup_index();
+
+        index.add_frame(1, 1000, "coding stuff", "Editor", "vscode", None).unwrap();
+        index.add_frame(2, 2000, "coding stuff", "Browser", "chrome", None).unwrap();
+        index.commit().unwrap();
+
+        let filters = SearchFilters {
+            app_ids: Some(vec!["vscode".to_string()]),
+            ..Default::default()
+        };
+        let results = index.search("coding", &filters, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].app_id, "vscode");
+    }
+
+    #[test]
+    fn test_search_window_title() {
+        let (_dir, index) = setup_index();
+
+        index.add_frame(1, 1000, "", "Important Document.pdf - Preview", "preview", None).unwrap();
+        index.commit().unwrap();
+
+        let results = index.search("Important Document", &SearchFilters::default(), 10).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_num_docs() {
+        let (_dir, index) = setup_index();
+        assert_eq!(index.num_docs(), 0);
+
+        for i in 0..5 {
+            index.add_frame(i, i as u64 * 1000, "text", "win", "app", None).unwrap();
+        }
+        index.commit().unwrap();
+        assert_eq!(index.num_docs(), 5);
     }
 }
