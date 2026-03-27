@@ -1,6 +1,7 @@
 pub mod db;
 pub mod segments;
 pub mod retention;
+pub mod encrypted;
 
 use serde::{Deserialize, Serialize};
 

@@ -5,6 +5,7 @@ pub mod ocr;
 pub mod privacy;
 pub mod search;
 pub mod storage;
+pub mod tray;
 
 use std::sync::Arc;
 
@@ -32,7 +33,6 @@ pub fn run() {
     let db_path = config.data_dir().join("workshadow.db");
     std::fs::create_dir_all(config.data_dir()).ok();
     let db = Database::open(&db_path).expect("Failed to open database");
-    log::info!("Database opened at {:?}", db_path);
 
     // Initialize search index
     let search_index = Arc::new(
@@ -48,7 +48,21 @@ pub fn run() {
     // Initialize privacy components
     let audit_log = AuditLog::new(&config.data_dir());
     let key_manager = KeyManager::new(&config.data_dir());
-    log::info!("Encryption key loaded");
+    log::info!(
+        "Encryption key loaded (storage: {:?})",
+        key_manager.storage()
+    );
+
+    // Encrypt any unencrypted segments from previous sessions
+    {
+        let key = *key_manager.key();
+        let data_dir = config.data_dir();
+        match storage::encrypted::encrypt_segments_in_dir(&data_dir, &key) {
+            Ok(0) => {}
+            Ok(n) => log::info!("Encrypted {} unencrypted segment files from previous session", n),
+            Err(e) => log::warn!("Failed to encrypt existing segments: {}", e),
+        }
+    }
 
     // Initialize capture pipeline
     let pipeline = CapturePipeline::new(config.capture.clone());
@@ -101,8 +115,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .setup(|app| {
-            // Register global hotkey: Ctrl+Shift+P (Cmd+Shift+P on macOS)
-            setup_global_hotkey(app.handle().clone());
+            let handle = app.handle().clone();
+
+            // Set up system tray
+            if let Err(e) = tray::setup_tray(&handle) {
+                log::warn!("Failed to set up system tray: {}", e);
+            }
+
+            // Register global hotkey
+            setup_global_hotkey(handle);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -139,7 +161,6 @@ fn setup_global_hotkey(app_handle: tauri::AppHandle) {
         }
     };
 
-    // Parse Ctrl+Shift+P (uses Cmd on macOS automatically)
     let hotkey = match "ctrl+shift+KeyP".parse::<HotKey>() {
         Ok(hk) => hk,
         Err(e) => {
@@ -157,11 +178,9 @@ fn setup_global_hotkey(app_handle: tauri::AppHandle) {
 
     log::info!("Global hotkey registered: Ctrl+Shift+P (pause/resume)");
 
-    // Listen for hotkey events on a background thread
     std::thread::Builder::new()
         .name("ws-hotkey".to_string())
         .spawn(move || {
-            // Keep manager alive
             let _manager = manager;
             let receiver = GlobalHotKeyEvent::receiver();
 
@@ -192,9 +211,7 @@ fn setup_global_hotkey(app_handle: tauri::AppHandle) {
                                     .ok();
                                 log::info!("Capture resumed via hotkey");
                             }
-                            capture::CaptureState::Idle => {
-                                log::debug!("Hotkey pressed but capture is idle");
-                            }
+                            capture::CaptureState::Idle => {}
                         }
                     }
                 }

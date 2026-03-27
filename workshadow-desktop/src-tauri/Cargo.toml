@@ -33,3 +33,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
 global-hotkey = "0.6"
 sha2 = "0.10"
+keyring = "3"

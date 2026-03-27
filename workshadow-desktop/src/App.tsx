@@ -1,17 +1,36 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Timeline } from "./views/Timeline";
 import { Search } from "./views/Search";
 import { Settings } from "./views/Settings";
 import { Summary } from "./views/Summary";
+import { Onboarding } from "./views/Onboarding";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { useCaptureStatus } from "./hooks/useCaptureStatus";
 import "./index.css";
 
 type View = "timeline" | "search" | "summary" | "settings";
 
+const ONBOARDING_KEY = "workshadow_onboarded";
+
 function App() {
   const [activeView, setActiveView] = useState<View>("timeline");
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const { status, startCapture, pauseCapture } = useCaptureStatus();
+
+  useEffect(() => {
+    if (!localStorage.getItem(ONBOARDING_KEY)) {
+      setShowOnboarding(true);
+    }
+  }, []);
+
+  const handleOnboardingComplete = () => {
+    localStorage.setItem(ONBOARDING_KEY, "true");
+    setShowOnboarding(false);
+  };
+
+  if (showOnboarding) {
+    return <Onboarding onComplete={handleOnboardingComplete} />;
+  }
 
   const handleToggle = () => {
     if (status.state === "Recording") {
