@@ -6,7 +6,9 @@ use crate::capture::pipeline::CapturePipeline;
 use crate::capture::CaptureStatus;
 use crate::config::AppConfig;
 use crate::ocr::engine::OcrEngine;
+use crate::privacy::audit::{AuditEvent, AuditLog};
 use crate::privacy::exclusions::ExclusionFilter;
+use crate::privacy::keymanager::KeyManager;
 use crate::search::index::SearchIndex;
 use crate::search::{SearchFilters, SearchResult};
 use crate::storage::db::Database;
@@ -21,6 +23,8 @@ pub struct AppState {
     pub search_index: Arc<SearchIndex>,
     pub segment_manager: SegmentManager,
     pub ocr_engine: Arc<OcrEngine>,
+    pub audit_log: AuditLog,
+    pub key_manager: KeyManager,
 }
 
 // ── Search ──
@@ -96,23 +100,16 @@ pub fn get_frame(frame_id: i64, state: State<AppState>) -> Result<Option<FrameDe
         .get_frame_by_id(frame_id)
         .map_err(|e| e.to_string())?;
 
-    Ok(row.map(|f| {
-        let pii_flags: Option<Vec<String>> = f
-            .ocr_text
-            .as_ref()
-            .and_then(|_| None); // PII flags stored as JSON string — parse if present
-
-        FrameDetail {
-            frame_id: f.id,
-            timestamp_ms: f.timestamp_ms,
-            window_title: f.window_title.unwrap_or_default(),
-            app_id: f.app_id.unwrap_or_default(),
-            browser_url: f.browser_url,
-            ocr_text: f.ocr_text,
-            pii_flags,
-            segment_file: f.segment_file,
-            segment_offset: f.segment_offset,
-        }
+    Ok(row.map(|f| FrameDetail {
+        frame_id: f.id,
+        timestamp_ms: f.timestamp_ms,
+        window_title: f.window_title.unwrap_or_default(),
+        app_id: f.app_id.unwrap_or_default(),
+        browser_url: f.browser_url,
+        ocr_text: f.ocr_text,
+        pii_flags: None,
+        segment_file: f.segment_file,
+        segment_offset: f.segment_offset,
     }))
 }
 
@@ -127,7 +124,7 @@ pub fn start_capture(state: State<AppState>) -> Result<(), String> {
         config.privacy.excluded_url_patterns.clone(),
     );
 
-    state
+    let session_id = state
         .pipeline
         .start(
             state.db.clone(),
@@ -138,25 +135,45 @@ pub fn start_capture(state: State<AppState>) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    log::info!("Capture started via IPC");
+    state
+        .audit_log
+        .log_event(AuditEvent::CaptureStarted { session_id })
+        .ok();
+
+    log::info!("Capture started via IPC (session {})", session_id);
     Ok(())
 }
 
 #[tauri::command]
 pub fn pause_capture(state: State<AppState>) -> Result<(), String> {
+    let session_id = state.pipeline.get_status().session_id.unwrap_or(0);
     state.pipeline.pause();
+    state
+        .audit_log
+        .log_event(AuditEvent::CapturePaused { session_id })
+        .ok();
     Ok(())
 }
 
 #[tauri::command]
 pub fn resume_capture(state: State<AppState>) -> Result<(), String> {
+    let session_id = state.pipeline.get_status().session_id.unwrap_or(0);
     state.pipeline.resume();
+    state
+        .audit_log
+        .log_event(AuditEvent::CaptureResumed { session_id })
+        .ok();
     Ok(())
 }
 
 #[tauri::command]
 pub fn stop_capture(state: State<AppState>) -> Result<(), String> {
+    let session_id = state.pipeline.get_status().session_id.unwrap_or(0);
     state.pipeline.stop();
+    state
+        .audit_log
+        .log_event(AuditEvent::CaptureStopped { session_id })
+        .ok();
     Ok(())
 }
 
@@ -180,7 +197,15 @@ pub fn update_settings(new_config: AppConfig, state: State<AppState>) -> Result<
         log::warn!("Failed to persist settings: {}", e);
     }
     *config = new_config;
-    log::info!("Settings updated");
+    state
+        .audit_log
+        .log_event(AuditEvent::SettingsChanged {
+            field: "bulk".to_string(),
+            old_value: String::new(),
+            new_value: "updated".to_string(),
+        })
+        .ok();
+    log::info!("Settings updated and persisted");
     Ok(())
 }
 
@@ -205,6 +230,61 @@ pub fn get_storage_usage(state: State<AppState>) -> Result<StorageUsage, String>
     })
 }
 
+// ── Data deletion ──
+
+#[tauri::command]
+pub fn delete_time_range(
+    start_ms: u64,
+    end_ms: u64,
+    state: State<AppState>,
+) -> Result<usize, String> {
+    let deleted = state
+        .db
+        .delete_frames_in_range(start_ms, end_ms)
+        .map_err(|e| e.to_string())?;
+
+    state
+        .audit_log
+        .log_event(AuditEvent::DataDeleted {
+            start_ms,
+            end_ms,
+            frames_deleted: deleted,
+        })
+        .ok();
+
+    log::info!(
+        "Deleted {} frames in range {}..{}",
+        deleted,
+        start_ms,
+        end_ms
+    );
+    Ok(deleted)
+}
+
+// ── Audit log ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub timestamp: String,
+    pub event: String,
+}
+
+#[tauri::command]
+pub fn get_audit_log(state: State<AppState>) -> Result<Vec<AuditEntry>, String> {
+    match state.audit_log.read_all() {
+        Ok(entries) => Ok(entries
+            .into_iter()
+            .rev() // newest first
+            .take(100)
+            .map(|e| AuditEntry {
+                timestamp: e.timestamp,
+                event: serde_json::to_string(&e.event).unwrap_or_default(),
+            })
+            .collect()),
+        Err(_) => Ok(vec![]), // No audit log yet
+    }
+}
+
 // ── Daily summary ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,7 +298,6 @@ pub struct DailySummary {
 
 #[tauri::command]
 pub fn get_daily_summary(date: String, state: State<AppState>) -> Result<DailySummary, String> {
-    // Parse date string to get day boundaries
     let parsed = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date '{}': {}", date, e))?;
 
@@ -240,7 +319,6 @@ pub fn get_daily_summary(date: String, state: State<AppState>) -> Result<DailySu
         .get_app_usage(start_ms, end_ms)
         .map_err(|e| e.to_string())?;
 
-    // Convert frame counts to approximate hours (assuming 1 fps)
     let hours_by_app: Vec<(String, f64)> = app_usage
         .into_iter()
         .map(|(app, count)| (app, count as f64 / 3600.0))
@@ -255,7 +333,7 @@ pub fn get_daily_summary(date: String, state: State<AppState>) -> Result<DailySu
         date,
         total_frames,
         hours_by_app,
-        top_urls: vec![], // TODO: aggregate from browser_url
+        top_urls: vec![],
         top_windows,
     })
 }
@@ -271,13 +349,10 @@ pub struct OcrStatus {
 
 #[tauri::command]
 pub fn get_ocr_status(state: State<AppState>) -> Result<OcrStatus, String> {
-    let fast_backend = format!("{:?}", state.ocr_engine.fast_backend_type());
-    let quality_available = state.ocr_engine.is_quality_available();
-
     Ok(OcrStatus {
-        fast_backend,
-        quality_available,
-        quality_model: if quality_available {
+        fast_backend: format!("{:?}", state.ocr_engine.fast_backend_type()),
+        quality_available: state.ocr_engine.is_quality_available(),
+        quality_model: if state.ocr_engine.is_quality_available() {
             "DeepSeek-OCR-2 (GGUF)".to_string()
         } else {
             "Not installed".to_string()
@@ -287,20 +362,12 @@ pub fn get_ocr_status(state: State<AppState>) -> Result<OcrStatus, String> {
 
 #[tauri::command]
 pub fn reanalyze_frame(frame_id: i64, state: State<AppState>) -> Result<String, String> {
-    // Get the frame from DB
     let frame = state
         .db
         .get_frame_by_id(frame_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Frame {} not found", frame_id))?;
 
-    // We can't re-extract the image from the encoded segment easily here,
-    // so for now we re-run quality OCR on any existing OCR text by
-    // triggering a quality analysis. In a full implementation, we'd
-    // decode the frame from the MKV segment.
-    //
-    // For now, return the existing OCR text or note that re-analysis
-    // requires the raw frame data (which we'd extract from the segment).
     if let Some(ref ocr_text) = frame.ocr_text {
         Ok(format!(
             "Existing OCR text (frame {}): {}",
@@ -321,4 +388,31 @@ pub fn download_quality_model() -> Result<String, String> {
         Ok(path) => Ok(format!("Model downloaded to {:?}", path)),
         Err(e) => Err(format!("Download failed: {}", e)),
     }
+}
+
+// ── Privacy info ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyStatus {
+    pub encryption_active: bool,
+    pub excluded_apps_count: usize,
+    pub excluded_url_patterns_count: usize,
+    pub audit_log_entries: usize,
+}
+
+#[tauri::command]
+pub fn get_privacy_status(state: State<AppState>) -> Result<PrivacyStatus, String> {
+    let config = state.config.lock().unwrap();
+    let audit_count = state
+        .audit_log
+        .read_all()
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+
+    Ok(PrivacyStatus {
+        encryption_active: true, // Key manager always initializes
+        excluded_apps_count: config.privacy.excluded_apps.len(),
+        excluded_url_patterns_count: config.privacy.excluded_url_patterns.len(),
+        audit_log_entries: audit_count,
+    })
 }

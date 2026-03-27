@@ -154,4 +154,18 @@ export const ipc = {
     invoke<string>("reanalyze_frame", { frameId }),
 
   downloadQualityModel: () => invoke<string>("download_quality_model"),
+
+  deleteTimeRange: (startMs: number, endMs: number) =>
+    invoke<number>("delete_time_range", { startMs, endMs }),
+
+  getAuditLog: () =>
+    invoke<{ timestamp: string; event: string }[]>("get_audit_log"),
+
+  getPrivacyStatus: () =>
+    invoke<{
+      encryption_active: boolean;
+      excluded_apps_count: number;
+      excluded_url_patterns_count: number;
+      audit_log_entries: number;
+    }>("get_privacy_status"),
 };

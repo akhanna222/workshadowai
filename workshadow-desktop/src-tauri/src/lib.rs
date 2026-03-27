@@ -10,8 +10,12 @@ use std::sync::Arc;
 
 use capture::pipeline::CapturePipeline;
 use config::AppConfig;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use ipc::commands::*;
+use tauri::Manager;
 use ocr::engine::OcrEngine;
+use privacy::audit::AuditLog;
+use privacy::keymanager::KeyManager;
 use search::index::SearchIndex;
 use storage::db::Database;
 use storage::segments::SegmentManager;
@@ -34,13 +38,17 @@ pub fn run() {
     let search_index = Arc::new(
         SearchIndex::open(&config.index_dir()).expect("Failed to open search index"),
     );
-    log::info!("Search index opened at {:?}", config.index_dir());
 
     // Initialize segment manager
     let segment_manager = SegmentManager::new(config.data_dir());
 
     // Initialize OCR engine (tiered: fast + quality)
     let ocr_engine = Arc::new(OcrEngine::new(config.ocr.clone()));
+
+    // Initialize privacy components
+    let audit_log = AuditLog::new(&config.data_dir());
+    let key_manager = KeyManager::new(&config.data_dir());
+    log::info!("Encryption key loaded");
 
     // Initialize capture pipeline
     let pipeline = CapturePipeline::new(config.capture.clone());
@@ -56,12 +64,6 @@ pub fn run() {
         std::thread::Builder::new()
             .name("ws-retention".to_string())
             .spawn(move || {
-                log::info!(
-                    "Retention scheduler started (every {}h, max {}d / {}GB)",
-                    cleanup_hours,
-                    max_days,
-                    max_gb
-                );
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(
                         cleanup_hours as u64 * 3600,
@@ -76,7 +78,7 @@ pub fn run() {
                         Ok(deleted) if deleted > 0 => {
                             log::info!("Retention cleanup: removed {} items", deleted);
                         }
-                        Ok(_) => log::debug!("Retention cleanup: nothing to remove"),
+                        Ok(_) => {}
                         Err(e) => log::error!("Retention cleanup error: {}", e),
                     }
                 }
@@ -91,11 +93,18 @@ pub fn run() {
         search_index,
         segment_manager,
         ocr_engine,
+        audit_log,
+        key_manager,
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
+        .setup(|app| {
+            // Register global hotkey: Ctrl+Shift+P (Cmd+Shift+P on macOS)
+            setup_global_hotkey(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             search,
             get_timeline_range,
@@ -112,7 +121,84 @@ pub fn run() {
             get_ocr_status,
             reanalyze_frame,
             download_quality_model,
+            delete_time_range,
+            get_audit_log,
+            get_privacy_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running WorkShadow AI");
+}
+
+/// Set up the global hotkey for pause/resume (Ctrl+Shift+P / Cmd+Shift+P).
+fn setup_global_hotkey(app_handle: tauri::AppHandle) {
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("Failed to initialize global hotkey manager: {}", e);
+            return;
+        }
+    };
+
+    // Parse Ctrl+Shift+P (uses Cmd on macOS automatically)
+    let hotkey = match "ctrl+shift+KeyP".parse::<HotKey>() {
+        Ok(hk) => hk,
+        Err(e) => {
+            log::warn!("Failed to parse hotkey: {}", e);
+            return;
+        }
+    };
+
+    let hotkey_id = hotkey.id();
+
+    if let Err(e) = manager.register(hotkey) {
+        log::warn!("Failed to register global hotkey Ctrl+Shift+P: {}", e);
+        return;
+    }
+
+    log::info!("Global hotkey registered: Ctrl+Shift+P (pause/resume)");
+
+    // Listen for hotkey events on a background thread
+    std::thread::Builder::new()
+        .name("ws-hotkey".to_string())
+        .spawn(move || {
+            // Keep manager alive
+            let _manager = manager;
+            let receiver = GlobalHotKeyEvent::receiver();
+
+            loop {
+                if let Ok(event) = receiver.recv() {
+                    if event.id() == hotkey_id && event.state() == HotKeyState::Pressed {
+                        let state: tauri::State<AppState> = app_handle.state();
+                        let status = state.pipeline.get_status();
+
+                        match status.state {
+                            capture::CaptureState::Recording => {
+                                state.pipeline.pause();
+                                state
+                                    .audit_log
+                                    .log_event(privacy::audit::AuditEvent::CapturePaused {
+                                        session_id: status.session_id.unwrap_or(0),
+                                    })
+                                    .ok();
+                                log::info!("Capture paused via hotkey");
+                            }
+                            capture::CaptureState::Paused => {
+                                state.pipeline.resume();
+                                state
+                                    .audit_log
+                                    .log_event(privacy::audit::AuditEvent::CaptureResumed {
+                                        session_id: status.session_id.unwrap_or(0),
+                                    })
+                                    .ok();
+                                log::info!("Capture resumed via hotkey");
+                            }
+                            capture::CaptureState::Idle => {
+                                log::debug!("Hotkey pressed but capture is idle");
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .expect("Failed to spawn hotkey thread");
 }

@@ -1,6 +1,7 @@
 pub mod encryption;
 pub mod exclusions;
 pub mod audit;
+pub mod keymanager;
 
 use serde::{Deserialize, Serialize};
 

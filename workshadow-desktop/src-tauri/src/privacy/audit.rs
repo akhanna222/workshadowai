@@ -16,8 +16,8 @@ pub enum AuditEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLogEntry {
-    timestamp: String,
-    event: AuditEvent,
+    pub timestamp: String,
+    pub event: AuditEvent,
 }
 
 /// Append-only audit log for capture and data events.
