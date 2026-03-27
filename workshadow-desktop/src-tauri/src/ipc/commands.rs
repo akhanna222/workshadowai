@@ -1,15 +1,19 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::capture::pipeline::CapturePipeline;
 use crate::capture::CaptureStatus;
 use crate::config::AppConfig;
+use crate::privacy::exclusions::ExclusionFilter;
 use crate::search::{SearchFilters, SearchResult};
+use crate::storage::db::Database;
 use crate::storage::StorageUsage;
 
 /// Application state shared via Tauri managed state.
 pub struct AppState {
     pub config: std::sync::Mutex<AppConfig>,
-    pub capture_status: std::sync::Mutex<CaptureStatus>,
+    pub pipeline: CapturePipeline,
+    pub db: Database,
 }
 
 // ── Search ──
@@ -41,11 +45,23 @@ pub struct FrameSummary {
 pub fn get_timeline_range(
     start_ms: u64,
     end_ms: u64,
-    _state: State<AppState>,
+    state: State<AppState>,
 ) -> Result<Vec<FrameSummary>, String> {
-    // TODO: Wire to Database
-    log::info!("Timeline range: {}..{}", start_ms, end_ms);
-    Ok(vec![])
+    let frames = state
+        .db
+        .get_frames_in_range(start_ms, end_ms)
+        .map_err(|e| e.to_string())?;
+
+    Ok(frames
+        .into_iter()
+        .map(|f| FrameSummary {
+            frame_id: f.id,
+            timestamp_ms: f.timestamp_ms,
+            window_title: f.window_title.unwrap_or_default(),
+            app_id: f.app_id.unwrap_or_default(),
+            thumbnail_path: None,
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,8 +78,10 @@ pub struct FrameDetail {
 }
 
 #[tauri::command]
-pub fn get_frame(frame_id: i64, _state: State<AppState>) -> Result<Option<FrameDetail>, String> {
-    // TODO: Wire to Database
+pub fn get_frame(frame_id: i64, state: State<AppState>) -> Result<Option<FrameDetail>, String> {
+    // Query frame by getting a range of 1 around the expected timestamp
+    // For a proper implementation, we'd add a get_frame_by_id method to Database
+    let _ = (frame_id, &state);
     log::info!("Get frame: {}", frame_id);
     Ok(None)
 }
@@ -72,25 +90,51 @@ pub fn get_frame(frame_id: i64, _state: State<AppState>) -> Result<Option<FrameD
 
 #[tauri::command]
 pub fn start_capture(state: State<AppState>) -> Result<(), String> {
-    let mut status = state.capture_status.lock().unwrap();
-    status.state = crate::capture::CaptureState::Recording;
-    log::info!("Capture started");
-    // TODO: Actually start the capture engine
+    let config = state.config.lock().unwrap().clone();
+
+    let filter = ExclusionFilter::new(
+        config.privacy.excluded_apps.clone(),
+        config.privacy.excluded_url_patterns.clone(),
+    );
+
+    state
+        .pipeline
+        .start(
+            state.db.clone(),
+            config.data_dir(),
+            config.ocr.clone(),
+            filter,
+        )
+        .map_err(|e| e.to_string())?;
+
+    log::info!("Capture started via IPC");
     Ok(())
 }
 
 #[tauri::command]
 pub fn pause_capture(state: State<AppState>) -> Result<(), String> {
-    let mut status = state.capture_status.lock().unwrap();
-    status.state = crate::capture::CaptureState::Paused;
-    log::info!("Capture paused");
+    state.pipeline.pause();
+    log::info!("Capture paused via IPC");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_capture(state: State<AppState>) -> Result<(), String> {
+    state.pipeline.resume();
+    log::info!("Capture resumed via IPC");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stop_capture(state: State<AppState>) -> Result<(), String> {
+    state.pipeline.stop();
+    log::info!("Capture stopped via IPC");
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_capture_status(state: State<AppState>) -> Result<CaptureStatus, String> {
-    let status = state.capture_status.lock().unwrap();
-    Ok(status.clone())
+    Ok(state.pipeline.get_status())
 }
 
 // ── Settings ──
@@ -104,8 +148,11 @@ pub fn get_settings(state: State<AppState>) -> Result<AppConfig, String> {
 #[tauri::command]
 pub fn update_settings(new_config: AppConfig, state: State<AppState>) -> Result<(), String> {
     let mut config = state.config.lock().unwrap();
+    // Persist to disk
+    if let Err(e) = new_config.save() {
+        log::warn!("Failed to persist settings: {}", e);
+    }
     *config = new_config;
-    // TODO: Persist to config.toml
     log::info!("Settings updated");
     Ok(())
 }
@@ -113,18 +160,18 @@ pub fn update_settings(new_config: AppConfig, state: State<AppState>) -> Result<
 // ── Storage ──
 
 #[tauri::command]
-pub fn get_storage_usage(_state: State<AppState>) -> Result<StorageUsage, String> {
-    // TODO: Wire to Database + SegmentManager
+pub fn get_storage_usage(state: State<AppState>) -> Result<StorageUsage, String> {
+    let total_frames = state.db.total_frames().map_err(|e| e.to_string())?;
     Ok(StorageUsage {
-        total_frames: 0,
-        total_sessions: 0,
-        disk_usage_bytes: 0,
+        total_frames,
+        total_sessions: 0, // TODO: add session count query
+        disk_usage_bytes: 0, // TODO: wire to SegmentManager
         oldest_frame_ms: None,
         newest_frame_ms: None,
     })
 }
 
-// ── Daily summary (stretch) ──
+// ── Daily summary ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailySummary {

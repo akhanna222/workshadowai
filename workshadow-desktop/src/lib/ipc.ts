@@ -123,6 +123,10 @@ export const ipc = {
 
   pauseCapture: () => invoke<void>("pause_capture"),
 
+  resumeCapture: () => invoke<void>("resume_capture"),
+
+  stopCapture: () => invoke<void>("stop_capture"),
+
   getCaptureStatus: () => invoke<CaptureStatus>("get_capture_status"),
 
   getSettings: () => invoke<AppConfig>("get_settings"),

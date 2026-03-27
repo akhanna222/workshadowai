@@ -1,6 +1,7 @@
 pub mod screen;
 pub mod encoder;
 pub mod metadata;
+pub mod pipeline;
 
 use serde::{Deserialize, Serialize};
 
