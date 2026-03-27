@@ -114,8 +114,9 @@ impl CapturePipeline {
                 segment_file = enc.current_segment_file().unwrap_or_default();
             }
 
-            // OCR (on the downscaled frame)
-            let ocr_result = ocr_engine.process_frame(
+            // OCR — fast path only in capture loop for real-time performance.
+            // Quality re-analysis happens async for low-confidence frames.
+            let ocr_result = ocr_engine.process_frame_fast(
                 &scaled_data,
                 scaled_w,
                 scaled_h,

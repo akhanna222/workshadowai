@@ -5,6 +5,7 @@ use tauri::State;
 use crate::capture::pipeline::CapturePipeline;
 use crate::capture::CaptureStatus;
 use crate::config::AppConfig;
+use crate::ocr::engine::OcrEngine;
 use crate::privacy::exclusions::ExclusionFilter;
 use crate::search::index::SearchIndex;
 use crate::search::{SearchFilters, SearchResult};
@@ -19,6 +20,7 @@ pub struct AppState {
     pub db: Database,
     pub search_index: Arc<SearchIndex>,
     pub segment_manager: SegmentManager,
+    pub ocr_engine: Arc<OcrEngine>,
 }
 
 // ── Search ──
@@ -256,4 +258,67 @@ pub fn get_daily_summary(date: String, state: State<AppState>) -> Result<DailySu
         top_urls: vec![], // TODO: aggregate from browser_url
         top_windows,
     })
+}
+
+// ── OCR ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrStatus {
+    pub fast_backend: String,
+    pub quality_available: bool,
+    pub quality_model: String,
+}
+
+#[tauri::command]
+pub fn get_ocr_status(state: State<AppState>) -> Result<OcrStatus, String> {
+    let fast_backend = format!("{:?}", state.ocr_engine.fast_backend_type());
+    let quality_available = state.ocr_engine.is_quality_available();
+
+    Ok(OcrStatus {
+        fast_backend,
+        quality_available,
+        quality_model: if quality_available {
+            "DeepSeek-OCR-2 (GGUF)".to_string()
+        } else {
+            "Not installed".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+pub fn reanalyze_frame(frame_id: i64, state: State<AppState>) -> Result<String, String> {
+    // Get the frame from DB
+    let frame = state
+        .db
+        .get_frame_by_id(frame_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Frame {} not found", frame_id))?;
+
+    // We can't re-extract the image from the encoded segment easily here,
+    // so for now we re-run quality OCR on any existing OCR text by
+    // triggering a quality analysis. In a full implementation, we'd
+    // decode the frame from the MKV segment.
+    //
+    // For now, return the existing OCR text or note that re-analysis
+    // requires the raw frame data (which we'd extract from the segment).
+    if let Some(ref ocr_text) = frame.ocr_text {
+        Ok(format!(
+            "Existing OCR text (frame {}): {}",
+            frame_id,
+            ocr_text.chars().take(500).collect::<String>()
+        ))
+    } else {
+        Ok(format!(
+            "Frame {} has no OCR text. Re-analysis from video segments is planned for a future update.",
+            frame_id
+        ))
+    }
+}
+
+#[tauri::command]
+pub fn download_quality_model() -> Result<String, String> {
+    match crate::ocr::quality::QualityOcrBackend::download_model() {
+        Ok(path) => Ok(format!("Model downloaded to {:?}", path)),
+        Err(e) => Err(format!("Download failed: {}", e)),
+    }
 }

@@ -1,13 +1,16 @@
 import { useState, useEffect } from "react";
-import { ipc, AppConfig } from "../lib/ipc";
+import { ipc, AppConfig, OcrStatus } from "../lib/ipc";
 
 export function Settings() {
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [ocrStatus, setOcrStatus] = useState<OcrStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   useEffect(() => {
     ipc.getSettings().then(setConfig).catch(console.error);
+    ipc.getOcrStatus().then(setOcrStatus).catch(console.error);
   }, []);
 
   const save = async () => {
@@ -155,6 +158,73 @@ export function Settings() {
             className="rounded"
           />
           <label className="text-sm">Enable PII Detection</label>
+        </div>
+      </Section>
+
+      {/* OCR */}
+      <Section title="OCR Engine">
+        {ocrStatus && (
+          <div className="space-y-2 mb-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-[var(--ws-text-muted)]">Fast Backend</span>
+              <span className="text-sm font-medium">{ocrStatus.fast_backend}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-[var(--ws-text-muted)]">Quality Model</span>
+              <div className="flex items-center gap-2">
+                <span
+                  className="w-2 h-2 rounded-full"
+                  style={{
+                    backgroundColor: ocrStatus.quality_available ? "var(--ws-ide)" : "var(--ws-text-muted)",
+                  }}
+                />
+                <span className="text-sm">{ocrStatus.quality_model}</span>
+              </div>
+            </div>
+            {!ocrStatus.quality_available && (
+              <button
+                onClick={async () => {
+                  setDownloading(true);
+                  try {
+                    await ipc.downloadQualityModel();
+                    const status = await ipc.getOcrStatus();
+                    setOcrStatus(status);
+                  } catch (err) {
+                    console.error("Download failed:", err);
+                  } finally {
+                    setDownloading(false);
+                  }
+                }}
+                disabled={downloading}
+                className="mt-1 px-3 py-1.5 text-xs bg-[var(--ws-accent)] hover:bg-[var(--ws-accent-hover)] disabled:opacity-50 text-white rounded transition-colors"
+              >
+                {downloading ? "Downloading DeepSeek-OCR-2..." : "Download DeepSeek-OCR-2 Model (~3 GB)"}
+              </button>
+            )}
+          </div>
+        )}
+        <Field label="Quality Threshold">
+          <input
+            type="number"
+            step="0.1"
+            min="0"
+            max="1"
+            value={config.ocr.quality_threshold}
+            onChange={(e) =>
+              setConfig({ ...config, ocr: { ...config.ocr, quality_threshold: Number(e.target.value) } })
+            }
+          />
+        </Field>
+        <div className="flex items-center gap-2 mt-2">
+          <input
+            type="checkbox"
+            checked={config.ocr.quality_reanalysis}
+            onChange={(e) =>
+              setConfig({ ...config, ocr: { ...config.ocr, quality_reanalysis: e.target.checked } })
+            }
+            className="rounded"
+          />
+          <label className="text-sm">Auto re-analyze low-confidence frames with DeepSeek-OCR-2</label>
         </div>
       </Section>
     </div>

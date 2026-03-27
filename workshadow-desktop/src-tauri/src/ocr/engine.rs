@@ -1,57 +1,45 @@
-use super::{OcrConfig, OcrResult, TextBlock};
+use super::fast::FastOcrBackend;
+use super::quality::QualityOcrBackend;
+use super::{OcrBackendType, OcrConfig, OcrResult};
 
-/// OCR engine with pluggable backends.
-/// Priority: ONNX PaddleOCR → Tesseract CLI → disabled.
+/// Tiered OCR engine.
+///
+/// **Fast path** (always-on, ~1 fps): Apple Vision (macOS) or Tesseract.
+/// Runs on every captured frame. Optimized for speed (<50ms/frame).
+///
+/// **Quality path** (on-demand): DeepSeek-OCR-2 via llama.cpp GGUF.
+/// Triggered when:
+/// - Fast path confidence < quality_threshold
+/// - User requests re-analysis of a specific frame
+/// Slower (~1-5s/frame) but significantly more accurate.
 pub struct OcrEngine {
     config: OcrConfig,
-    backend: OcrBackend,
-}
-
-enum OcrBackend {
-    /// PaddleOCR via ONNX Runtime (future: requires model files).
-    #[allow(dead_code)]
-    OnnxPaddleOcr,
-    /// Tesseract CLI fallback — works if `tesseract` is installed.
-    TesseractCli,
-    /// No OCR available.
-    Disabled,
+    fast: FastOcrBackend,
+    quality: QualityOcrBackend,
 }
 
 impl OcrEngine {
     pub fn new(config: OcrConfig) -> Self {
-        if !config.enabled {
-            log::info!("OCR disabled by configuration");
-            return Self {
-                config,
-                backend: OcrBackend::Disabled,
-            };
-        }
+        let fast = FastOcrBackend::new(&config);
+        let quality = QualityOcrBackend::new(&config);
 
-        // Try to detect available OCR backend
-        let backend = Self::detect_backend(&config);
-        match &backend {
-            OcrBackend::TesseractCli => log::info!("OCR backend: Tesseract CLI"),
-            OcrBackend::OnnxPaddleOcr => log::info!("OCR backend: PaddleOCR (ONNX)"),
-            OcrBackend::Disabled => log::warn!("No OCR backend available — OCR will be skipped"),
-        }
+        log::info!(
+            "OCR engine initialized: fast={:?}, quality_available={}, threshold={}",
+            fast.backend_type(),
+            quality.is_available(),
+            config.quality_threshold
+        );
 
-        Self { config, backend }
+        Self {
+            config,
+            fast,
+            quality,
+        }
     }
 
-    fn detect_backend(_config: &OcrConfig) -> OcrBackend {
-        // TODO: Check for ONNX model files first
-        // let model_dir = dirs::data_dir().join("workshadow/models/paddleocr");
-        // if model_dir.join("det.onnx").exists() { return OcrBackend::OnnxPaddleOcr; }
-
-        // Check for tesseract CLI
-        if is_tesseract_available() {
-            return OcrBackend::TesseractCli;
-        }
-
-        OcrBackend::Disabled
-    }
-
-    /// Run OCR on a raw RGBA frame image.
+    /// Process a frame with the fast OCR backend.
+    /// If confidence is below threshold and quality backend is available,
+    /// automatically triggers quality re-analysis.
     pub fn process_frame(
         &self,
         image_data: &[u8],
@@ -59,124 +47,99 @@ impl OcrEngine {
         height: u32,
         timestamp_ms: u64,
     ) -> OcrResult {
-        match self.backend {
-            OcrBackend::Disabled => OcrResult {
+        if !self.config.enabled {
+            return OcrResult {
                 frame_timestamp_ms: timestamp_ms,
                 text_blocks: vec![],
                 full_text: String::new(),
-            },
-            OcrBackend::TesseractCli => {
-                self.process_with_tesseract(image_data, width, height, timestamp_ms)
-            }
-            OcrBackend::OnnxPaddleOcr => {
-                // TODO: ONNX inference pipeline
-                self.process_with_tesseract(image_data, width, height, timestamp_ms)
+                avg_confidence: 0.0,
+                backend: OcrBackendType::Disabled,
+            };
+        }
+
+        // 1. Run fast path
+        let fast_result = self.fast.process_frame(image_data, width, height, timestamp_ms);
+
+        // 2. Check if quality re-analysis is needed
+        if self.should_reanalyze(&fast_result) {
+            log::debug!(
+                "Fast OCR confidence {:.2} < threshold {:.2}, triggering quality re-analysis",
+                fast_result.avg_confidence,
+                self.config.quality_threshold
+            );
+            let quality_result =
+                self.quality
+                    .process_frame(image_data, width, height, timestamp_ms);
+
+            // Use quality result if it produced text
+            if !quality_result.full_text.is_empty() {
+                return quality_result;
             }
         }
+
+        fast_result
     }
 
-    /// Run OCR via Tesseract CLI.
-    /// Writes a temp PNG, runs `tesseract`, parses output.
-    fn process_with_tesseract(
+    /// Run only the fast OCR backend (used in the capture loop for speed).
+    pub fn process_frame_fast(
         &self,
         image_data: &[u8],
         width: u32,
         height: u32,
         timestamp_ms: u64,
     ) -> OcrResult {
-        use std::process::Command;
-
-        // Convert RGBA to PNG in a temp file
-        let tmp_result = tempfile::Builder::new()
-            .suffix(".png")
-            .tempfile();
-
-        let tmp_file = match tmp_result {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("Failed to create temp file for OCR: {}", e);
-                return empty_result(timestamp_ms);
-            }
-        };
-
-        let img = match image::RgbaImage::from_raw(width, height, image_data.to_vec()) {
-            Some(img) => img,
-            None => return empty_result(timestamp_ms),
-        };
-
-        // Downscale for OCR speed (1280x720 max)
-        let ocr_img = if width > 1280 || height > 720 {
-            let scale = (1280.0 / width as f64).min(720.0 / height as f64);
-            let nw = (width as f64 * scale) as u32;
-            let nh = (height as f64 * scale) as u32;
-            image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle)
-        } else {
-            img
-        };
-
-        if let Err(e) = ocr_img.save(tmp_file.path()) {
-            log::error!("Failed to save temp PNG for OCR: {}", e);
-            return empty_result(timestamp_ms);
+        if !self.config.enabled {
+            return OcrResult {
+                frame_timestamp_ms: timestamp_ms,
+                text_blocks: vec![],
+                full_text: String::new(),
+                avg_confidence: 0.0,
+                backend: OcrBackendType::Disabled,
+            };
         }
+        self.fast.process_frame(image_data, width, height, timestamp_ms)
+    }
 
-        // Run tesseract: input.png stdout --oem 3 --psm 3 -l <lang>
-        let output = Command::new("tesseract")
-            .arg(tmp_file.path())
-            .arg("stdout")
-            .args(["--oem", "3", "--psm", "3"])
-            .args(["-l", &self.config.language])
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let full_text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-
-                // Tesseract CLI doesn't give bounding boxes in plain text mode.
-                // For bounding boxes, we'd use TSV output. Keep it simple for now.
-                let text_blocks = if full_text.is_empty() {
-                    vec![]
-                } else {
-                    vec![TextBlock {
-                        text: full_text.clone(),
-                        confidence: 0.8, // Tesseract default confidence estimate
-                        bbox: (0.0, 0.0, 1.0, 1.0),
-                    }]
-                };
-
-                OcrResult {
-                    frame_timestamp_ms: timestamp_ms,
-                    text_blocks,
-                    full_text,
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                log::debug!("Tesseract failed: {}", stderr);
-                empty_result(timestamp_ms)
-            }
-            Err(e) => {
-                log::debug!("Tesseract exec failed: {}", e);
-                empty_result(timestamp_ms)
-            }
+    /// Run quality OCR on a frame (on-demand, e.g. user re-analysis).
+    pub fn process_frame_quality(
+        &self,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        timestamp_ms: u64,
+    ) -> OcrResult {
+        if !self.quality.is_available() {
+            log::warn!("Quality OCR requested but DeepSeek-OCR-2 is not available");
+            return self.fast.process_frame(image_data, width, height, timestamp_ms);
         }
+        self.quality
+            .process_frame(image_data, width, height, timestamp_ms)
     }
-}
 
-fn empty_result(timestamp_ms: u64) -> OcrResult {
-    OcrResult {
-        frame_timestamp_ms: timestamp_ms,
-        text_blocks: vec![],
-        full_text: String::new(),
+    /// Check if a fast result should trigger quality re-analysis.
+    fn should_reanalyze(&self, fast_result: &OcrResult) -> bool {
+        if !self.config.quality_reanalysis {
+            return false;
+        }
+        if !self.quality.is_available() {
+            return false;
+        }
+        // Re-analyze if: text was found but confidence is low
+        if fast_result.full_text.is_empty() {
+            return false; // No text = nothing to re-analyze
+        }
+        fast_result.avg_confidence < self.config.quality_threshold
     }
-}
 
-/// Check if tesseract CLI is installed and accessible.
-fn is_tesseract_available() -> bool {
-    std::process::Command::new("tesseract")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    /// Whether the quality (DeepSeek-OCR-2) backend is available.
+    pub fn is_quality_available(&self) -> bool {
+        self.quality.is_available()
+    }
+
+    /// Get the active fast backend type.
+    pub fn fast_backend_type(&self) -> &OcrBackendType {
+        self.fast.backend_type()
+    }
 }
 
 #[cfg(test)]
@@ -194,14 +157,63 @@ mod tests {
         assert!(result.full_text.is_empty());
         assert!(result.text_blocks.is_empty());
         assert_eq!(result.frame_timestamp_ms, 12345);
+        assert_eq!(result.backend, OcrBackendType::Disabled);
     }
 
     #[test]
-    fn test_ocr_engine_initializes() {
+    fn test_engine_initializes_with_fast_backend() {
         let config = OcrConfig::default();
         let engine = OcrEngine::new(config);
-        // Should not panic
-        let result = engine.process_frame(&vec![128u8; 320 * 240 * 4], 320, 240, 1000);
+        assert!(
+            *engine.fast_backend_type() == OcrBackendType::Tesseract
+                || *engine.fast_backend_type() == OcrBackendType::Disabled
+        );
+    }
+
+    #[test]
+    fn test_process_frame_fast() {
+        let config = OcrConfig::default();
+        let engine = OcrEngine::new(config);
+        let result = engine.process_frame_fast(&vec![128u8; 320 * 240 * 4], 320, 240, 1000);
         assert_eq!(result.frame_timestamp_ms, 1000);
+    }
+
+    #[test]
+    fn test_quality_not_available() {
+        let config = OcrConfig::default();
+        let engine = OcrEngine::new(config);
+        // In test env, DeepSeek model is not present
+        assert!(!engine.is_quality_available());
+    }
+
+    #[test]
+    fn test_should_not_reanalyze_when_disabled() {
+        let config = OcrConfig {
+            quality_reanalysis: false,
+            ..Default::default()
+        };
+        let engine = OcrEngine::new(config);
+        let result = OcrResult {
+            frame_timestamp_ms: 1000,
+            text_blocks: vec![],
+            full_text: "test".to_string(),
+            avg_confidence: 0.1,
+            backend: OcrBackendType::Tesseract,
+        };
+        assert!(!engine.should_reanalyze(&result));
+    }
+
+    #[test]
+    fn test_should_not_reanalyze_empty_text() {
+        let config = OcrConfig::default();
+        let engine = OcrEngine::new(config);
+        let result = OcrResult {
+            frame_timestamp_ms: 1000,
+            text_blocks: vec![],
+            full_text: String::new(),
+            avg_confidence: 0.0,
+            backend: OcrBackendType::Tesseract,
+        };
+        assert!(!engine.should_reanalyze(&result));
     }
 }

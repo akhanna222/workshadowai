@@ -11,6 +11,7 @@ use std::sync::Arc;
 use capture::pipeline::CapturePipeline;
 use config::AppConfig;
 use ipc::commands::*;
+use ocr::engine::OcrEngine;
 use search::index::SearchIndex;
 use storage::db::Database;
 use storage::segments::SegmentManager;
@@ -37,6 +38,9 @@ pub fn run() {
 
     // Initialize segment manager
     let segment_manager = SegmentManager::new(config.data_dir());
+
+    // Initialize OCR engine (tiered: fast + quality)
+    let ocr_engine = Arc::new(OcrEngine::new(config.ocr.clone()));
 
     // Initialize capture pipeline
     let pipeline = CapturePipeline::new(config.capture.clone());
@@ -86,6 +90,7 @@ pub fn run() {
         db,
         search_index,
         segment_manager,
+        ocr_engine,
     };
 
     tauri::Builder::default()
@@ -104,6 +109,9 @@ pub fn run() {
             update_settings,
             get_storage_usage,
             get_daily_summary,
+            get_ocr_status,
+            reanalyze_frame,
+            download_quality_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running WorkShadow AI");

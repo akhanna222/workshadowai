@@ -77,6 +77,15 @@ export interface OcrConfig {
   language: string;
   dedup_threshold: number;
   pii_detection: boolean;
+  quality_threshold: number;
+  deepseek_model_path: string | null;
+  quality_reanalysis: boolean;
+}
+
+export interface OcrStatus {
+  fast_backend: string;
+  quality_available: boolean;
+  quality_model: string;
 }
 
 export interface PrivacyConfig {
@@ -138,4 +147,11 @@ export const ipc = {
 
   getDailySummary: (date: string) =>
     invoke<DailySummary>("get_daily_summary", { date }),
+
+  getOcrStatus: () => invoke<OcrStatus>("get_ocr_status"),
+
+  reanalyzeFrame: (frameId: number) =>
+    invoke<string>("reanalyze_frame", { frameId }),
+
+  downloadQualityModel: () => invoke<string>("download_quality_model"),
 };
