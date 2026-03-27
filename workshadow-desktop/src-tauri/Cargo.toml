@@ -1,0 +1,30 @@
+[package]
+name = "workshadow-desktop"
+version = "0.1.0"
+description = "WorkShadow AI — The AI companion that learns by watching you work"
+authors = ["Theo Khanna Limited"]
+edition = "2021"
+
+[lib]
+name = "workshadow_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tantivy = "0.22"
+aes-gcm = "0.10"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "5"
